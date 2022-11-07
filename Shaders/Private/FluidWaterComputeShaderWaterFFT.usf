@@ -1,0 +1,197 @@
+#include "/Engine/Public/Platform.ush"
+
+/*=============================================================================
+Fluid water Compute Shader FFT: Math
+=============================================================================*/
+
+//Define PI
+#define MATH_PI				3.145926f
+#define MATH_PI2			6.291852f
+#define MATH_SQRT_2_HALF	0.7071068f
+
+//Forgot Where I Found This, Not Mine But It Gives Very Random Results That Have No Noticable Repeated Patterns
+float MathRandReallyRandom(const uint2 XY, const float Seed)
+{
+	const float2 Random2D = (1 / 4320.0f) * XY + float2 (0.25f,0.0f);
+	float Random = frac(dot(Random2D * Random2D, Seed));
+	Random = frac(Random * Random * (2 * Seed));
+	return  Random;
+}
+
+/*=============================================================================
+Fluid water Compute Shader FFT: Shared
+=============================================================================*/
+
+//Resolution (We Pass In Size As Metal Does Not Support "GetDimensions", Plus We Want To Sync Size With All Render Textures)
+float SharedResolution;
+
+/*=============================================================================
+Fluid water Compute Shader FFT: Gauss Distribution
+https://en.wikipedia.org/wiki/Normal_distribution
+=============================================================================*/
+
+//We Need Offsets For Random To Actually Have Random (They Do Not Need To Be Specefic But Diffrent On X And Y And By Big Margin) (Hard Coded So All Results Are Same, Good For Multiplayer And Same Results With Wave Paramaters)
+#define GAUSS_X_OFFSET	 	uint2(3,5)
+#define GAUSS_Y_OFFSET		uint2(1024,1024)
+#define GAUSS_Z_OFFSET	 	uint2(6,10)
+#define GAUSS_W_OFFSET		uint2(2048,2048)
+
+//GAUSS Seed (3000 - 6000 Gives Good Results) (Hard Coded So All Results Are Same, Good For Multiplayer And Same Results With Wave Paramaters)
+#define GAUSS_SEED	 		3571.0f
+
+//Texture To Hold Our Guass Distribution Texture (We Use This As Refrence For Debug But Regenerate It In Phillips Spectrum For Simpler Code)
+RWTexture2D<float4> GuassDistributionRWTexture;
+
+float GetGuassDistributionGuass(const uint2 XY, const float Seed)
+{
+	//U1 | U2
+	float U1 = MathRandReallyRandom(XY,Seed);
+	float U2 = MathRandReallyRandom(XY,Seed);
+
+	//Min U1 / U2
+	if (U1 < 1e-6f) U1 = 1e-6f;
+	if (U2 < 1e-6f) U2 = 1e-6f;
+
+	//Guass / Normal Distribution
+	return (sqrt(-2 * log(U1)) * cos(MATH_PI2 * U2));
+}
+
+[numthreads(8, 8, 1)]
+void ComputeGuassDistribution(uint3 ThreadId : SV_DispatchThreadID)
+{
+	//Get Guass
+	float4 Guass = float4(0,0,0,0);
+	Guass.x = GetGuassDistributionGuass(ThreadId.xy + GAUSS_X_OFFSET, GAUSS_SEED);
+	Guass.y = GetGuassDistributionGuass(ThreadId.xy + GAUSS_Y_OFFSET, GAUSS_SEED);
+	Guass.z = GetGuassDistributionGuass(ThreadId.xy + GAUSS_Z_OFFSET, GAUSS_SEED);
+	Guass.w = GetGuassDistributionGuass(ThreadId.xy + GAUSS_W_OFFSET, GAUSS_SEED);
+
+	//(Let User See Results Of Gauss Distribution, Not Used To Compute Anything Later On)
+	GuassDistributionRWTexture[ThreadId.xy] = Guass;
+}
+
+/*=============================================================================
+Fluid water Compute Shader FFT: Phillips Spectrum
+https://www.researchgate.net/publication/339565826_The_Phillips_spectrum_and_a_model_of_wind-wave_dissipation
+=============================================================================*/
+
+//Texture To Hold Our Guass Distribution Texture
+RWTexture2D<float4> PHKplusRenderRWTexture;
+RWTexture2D<float4> PHKminusRenderRWTexture;
+RWTexture2D<float4> H0KplusRWTexture;
+RWTexture2D<float4> H0KminusRWTexture;
+RWTexture2D<float4> H0KplusH0KminusRWTexture;
+float PhillipsSpectrumLength;
+float2 PhillipsSpectrumW;
+float4 PhillipsSpectrumAVGF;
+
+float GetPhillipsSpectrum(in float2 K)
+{
+	//Paramaters
+	float2 W = PhillipsSpectrumW; //Global Wind Direction
+	float a = PhillipsSpectrumAVGF.x; //Global Wave Amplitude
+    float v = PhillipsSpectrumAVGF.y; //Global Wind Speed 
+	float g = PhillipsSpectrumAVGF.z; //Global Gravitatinal Constant
+	float f = PhillipsSpectrumAVGF.w; //Global Wind Frequency
+	float L = (v * v) / g; //Wind Speed Affected By Gravity
+	float l = L * 0.001f; //Wind Speed Affected By Gravity Small
+    
+	//Get Wave Magintude
+	float k2 = dot(K,K); //Power Of 2
+	float k4 = k2 * k2; //Power Of 4
+
+    float PhK = 0.0f;
+    if (k2  > 0.0f)
+    {
+		//Get KW Dot (Normalized)
+        float KWDot2 = dot(normalize(K),normalize(W));
+		KWDot2 *= KWDot2; //Power Of 2
+
+		//Philips Spectrum Formula
+        PhK =  a * exp(-(1.0f / (k2 * L * L))) / k4 * (KWDot2);
+
+		//Modify Phillips Spectrum By Wind Frequency
+		if (KWDot2 < 0.0f)
+			PhK *= f;
+
+		//Suppress Waves Smaller Than A Small Length (l<<L)
+        PhK = PhK * exp(-k2 * l * l);
+    }
+    return PhK;
+}
+
+[numthreads(8, 8, 1)]
+void ComputePhillipsSpectrumH0KplusH0KMinus(uint3 ThreadId : SV_DispatchThreadID)
+{
+	//Get Guass (Just Regenerate It Here For Simpler Code, Same As In "InitializeGuassDistributionCompute")
+	float4 Guass = float4(0,0,0,0);
+	Guass.x = GetGuassDistributionGuass(ThreadId.xy + GAUSS_X_OFFSET, GAUSS_SEED);
+	Guass.y = GetGuassDistributionGuass(ThreadId.xy + GAUSS_Y_OFFSET, GAUSS_SEED);
+	Guass.z = GetGuassDistributionGuass(ThreadId.xy + GAUSS_Z_OFFSET, GAUSS_SEED);
+	Guass.w = GetGuassDistributionGuass(ThreadId.xy + GAUSS_W_OFFSET, GAUSS_SEED);
+
+	//Output Start
+	float4 Output = float4(0,0,0,1);
+
+	//Get nx | ny
+	float nx = ThreadId.x - SharedResolution / 2;
+	float ny = ThreadId.y - SharedResolution / 2;
+
+	//Get K
+	float2 K = float2(0,0);
+    K.x = (nx * MATH_PI2 / PhillipsSpectrumLength);
+    K.y = (ny * MATH_PI2 / PhillipsSpectrumLength);
+
+	//Ph(K)
+	float PhK = GetPhillipsSpectrum(K);
+	Output.xy = PhK;
+	PHKplusRenderRWTexture[ThreadId.xy] = Output;
+
+	//Ph(-K)
+	float PhKminus = GetPhillipsSpectrum(-K);
+	Output.xy = PhKminus;
+	PHKminusRenderRWTexture[ThreadId.xy] = Output;
+
+	//H0(K)
+	float h0k = MATH_SQRT_2_HALF * sqrt(PhK);
+	Output.xy = h0k * Guass.xy; //Do Guass Here Instead Of Above To Keep Color
+	H0KplusRWTexture[ThreadId.xy] = Output;
+	
+	//H0(-K)
+	float h0kminus = MATH_SQRT_2_HALF * sqrt(PhKminus);
+	Output.xy = h0kminus * Guass.zw; //Do Guass Here Instead Of Above To Keep Color
+	H0KminusRWTexture[ThreadId.xy] = Output;
+	
+	//H0(K) + H0(-K)
+	Output.xy = h0k * Guass.xy; //Do Guass Here Instead Of Above To Keep Color
+	Output.zw = h0kminus * Guass.zw; //Do Guass Here Instead Of Above To Keep Color
+	H0KplusH0KminusRWTexture[ThreadId.xy] = Output;
+}
+
+/*=============================================================================
+Fluid water Compute Shader FFT: FFT Butterfly
+=============================================================================*/
+
+RWTexture2D<float4> FFTButterflyRWTexture;
+
+[numthreads(8, 8, 1)]
+void ComputeFFTButterfly(uint3 ThreadId : SV_DispatchThreadID)
+{
+	FFTButterflyRWTexture[ThreadId.xy] = float4(0,0,0,1);
+}
+
+/*=============================================================================
+Fluid water Compute Shader FFT: HeightFields + DxDyDz
+=============================================================================*/
+
+RWTexture2D<float4> DxRWTexture;
+RWTexture2D<float4> DyRWTexture;
+RWTexture2D<float4> DzRWTexture;
+
+[numthreads(8, 8, 1)]
+void ComputeHeightFieldsPlusDisplacement(uint3 ThreadId : SV_DispatchThreadID)
+{
+	DxRWTexture[ThreadId.xy] = float4(0,0,0,1);
+	DyRWTexture[ThreadId.xy] = float4(0,0,0,1);
+	DzRWTexture[ThreadId.xy] = float4(0,0,0,1);
+}

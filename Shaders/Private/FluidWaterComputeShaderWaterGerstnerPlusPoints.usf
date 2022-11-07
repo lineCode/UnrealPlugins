@@ -1,0 +1,48 @@
+#include "/Engine/Public/Platform.ush"
+
+/*=============================================================================
+Fluid water Compute Shader Gerstner Plus Points : Shared
+=============================================================================*/
+
+//Resolution (We Pass In Size As Metal Does Not Support "GetDimensions", Plus We Want To Sync Size With All Render Textures)
+float SharedResolutionX;
+float SharedResolutionY;
+float SharedTime;
+
+/*=============================================================================
+Fluid water Compute Shader Gerstner Plus Points : Math
+=============================================================================*/
+
+//Define PI
+#define MATH_PI			3.145926f
+#define MATH_PI2		6.291852
+
+//Forgot Where I Found This, Not Mine
+float MathRandReallyRandom(const uint2 XY, const float Seed)
+{
+	const float2 Random2D = (1 / 4320.0f) * XY + float2 (0.25f,0.0f);
+	float Random = frac(dot(Random2D * Random2D, Seed));
+	Random = frac(Random * Random * (2 * Seed));
+	return  Random;
+}
+
+
+/*=============================================================================
+Fluid water Compute Shader Gerstner Plus Points : Gerstner + Point
+=============================================================================*/
+
+RWTexture2D<float4> OutputTexture;
+
+[numthreads(8, 8, 1)]
+void UpdateGerstnerPlusPointCompute(uint3 ThreadId : SV_DispatchThreadID)
+{
+	//Get UV
+	float UV = (ThreadId.xy / float2(SharedResolutionX,SharedResolutionY)) * 50;
+
+	float4 Output = (0.0f,0.0f,0.0f,1.0f);
+
+	Output.x = 2.0f + pow((sin(UV.x + SharedTime) + 1.0f) / 2.0f, 2.5f);
+
+	//Set 
+	OutputTexture[ThreadId.xy] = Output;
+}
